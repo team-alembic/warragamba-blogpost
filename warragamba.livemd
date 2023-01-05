@@ -1,0 +1,778 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# warragamba.livebook
+
+```elixir
+Mix.install(
+  [
+    {:httpoison, "~> 1.8"},
+    {:jason, "~> 1.4"},
+    {:vega_lite, "~> 0.1.5"},
+    {:kino, "~> 0.8.0"},
+    {:kino_vega_lite, "~> 0.1.1"},
+    {:explorer, "~> 0.4.0"},
+    {:axon, "~> 0.3.0"},
+    {:exla, "~> 0.4.0"},
+    {:nx, "~> 0.4.0"},
+    {:table_rex, "~> 3.1"}
+  ],
+  config: [
+    nx: [default_backend: EXLA.Backend]
+  ]
+)
+
+alias VegaLite, as: Vl
+alias Explorer.DataFrame, as: DF
+alias Explorer.Series
+
+# Sets the global compilation options
+Nx.Defn.global_default_options(compiler: EXLA)
+# Sets the process-level compilation options
+Nx.Defn.default_options(compiler: EXLA)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+[compiler: EXLA]
+```
+
+## Fetch Data From API
+
+```elixir
+# defining api calls to get data
+
+require Explorer.DataFrame
+
+defmodule WaterAPI do
+  require Logger
+
+  @water_nsw_api_endpoint "https://realtimedata.waternsw.com.au/cgi/webservice.pl"
+
+  def get_station_by_coords(longitude, latitude, radius) do
+    %{
+      "function" => "get_db_info",
+      "version" => 3,
+      "params" => %{
+        "table_name" => "site",
+        "return_type" => "array",
+        "filter_values" => %{"active" => "true"},
+        "geo_filter" => %{
+          "circle" => [longitude, latitude, radius]
+        }
+      }
+    }
+    |> Jason.encode!()
+    |> post_to_api()
+  end
+
+  def get_variable_list(station_ids, opts \\ []) do
+    data_source = Keyword.get(opts, :data_source, "A")
+    station_ids_as_string = Enum.join(station_ids, ",")
+
+    %{
+      "function" => "get_variable_list",
+      "version" => 1,
+      "params" => %{
+        "site_list" => station_ids_as_string,
+        "datasource" => data_source
+      }
+    }
+    |> Jason.encode!()
+    |> post_to_api()
+  end
+
+  def get_ts_trace(station_id, start_time, end_time, var_list, interval, aggregate, opts) do
+    datasource = Keyword.get(opts, :data_source, "A")
+    multiplier = Keyword.get(opts, :multiplier, "1")
+
+    var_list_string = Enum.join(var_list, ",")
+
+    %{
+      function: "get_ts_traces",
+      version: 2,
+      params: %{
+        site_list: station_id,
+        datasource: datasource,
+        start_time: start_time,
+        end_time: end_time,
+        var_list: var_list_string,
+        interval: interval,
+        multiplier: multiplier,
+        data_type: aggregate
+      }
+    }
+    |> Jason.encode!()
+    |> post_to_api()
+    |> case do
+      {:ok, data} ->
+        data["traces"]
+        |> List.first()
+        |> Map.get("trace")
+
+      {:error, msg} ->
+        msg
+    end
+  end
+
+  defp post_to_api(payload) do
+    HTTPoison.post!(
+      @water_nsw_api_endpoint,
+      payload,
+      [],
+      timeout: 50_000,
+      recv_timeout: 50_000
+    )
+    |> then(fn r -> r.body end)
+    |> Jason.decode!()
+    |> case do
+      %{"_return" => data} -> {:ok, data}
+      %{"error_msg" => error_msg} -> {:error, error_msg}
+    end
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, WaterAPI, <<70, 79, 82, 49, 0, 0, 17, ...>>, {:post_to_api, 1}}
+```
+
+```elixir
+defmodule Helper do
+  def rename_cols_by_id(dfs, station_ids, variable_no) do
+    for {df, station_id} <- Enum.zip(dfs, station_ids) do
+      DF.rename(
+        df,
+        q: "q_#{station_id}_#{variable_no}",
+        v: "v_#{station_id}_#{variable_no}"
+      )
+    end
+  end
+
+  def join_dfs(dfs, opts \\ []) when is_list(dfs) do
+    how = Keyword.get(opts, :how, :inner)
+    on = Keyword.get(opts, :on, nil)
+
+    Enum.reduce(dfs, fn df, acc ->
+      if on do
+        DF.join(df, acc, how: how, on: on)
+      else
+        DF.join(df, acc, how: how)
+      end
+    end)
+  end
+
+  def split_data(df, decimal) do
+    {first, second} =
+      df
+      |> DF.to_rows()
+      |> Enum.shuffle()
+      |> split_by_decimal(decimal)
+
+    {DF.new(first), DF.new(second)}
+  end
+
+  def df_to_tensor(df) do
+    df
+    |> DF.names()
+    |> Enum.map(&Explorer.Series.to_tensor(df[&1]))
+    |> Nx.stack(axis: 1)
+  end
+
+  def df_to_tensor_batches(df, batch_size) do
+    df
+    |> df_to_tensor()
+    |> Nx.shuffle(axis: 0)
+    |> Nx.to_batched(batch_size, leftover: :discard)
+  end
+
+  defp split_by_decimal(enum, decimal) do
+    row_no = Enum.count(enum)
+    Enum.split(enum, round(decimal * row_no))
+  end
+end
+
+# testing df_to_tensor
+Helper.df_to_tensor(DF.new(a: [1, 2, 3], b: [9, 7, 6]))
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Nx.Tensor<
+  s64[3][2]
+  EXLA.Backend<host:0, 0.719542020.2733506576.79390>
+  [
+    [1, 9],
+    [2, 7],
+    [3, 6]
+  ]
+>
+```
+
+```elixir
+# weather and stream station ids, closest to the dam, see here for more info:
+# https://realtimedata.waternsw.com.au/
+
+weather_station_ids = ["563035", "563046", "563079", "568045", "568051"]
+stream_station_ids = ["212250", "212270"]
+
+water_level_df =
+  WaterAPI.get_ts_trace(
+    "212242",
+    "20080130000000",
+    "20220112000000",
+    ["130.00"],
+    "day",
+    "mean",
+    datasource: "CP"
+  )
+  |> DF.new()
+  |> DF.mutate(v: Series.cast(v, :float))
+
+rainfall_dfs =
+  for station_id <- weather_station_ids do
+    WaterAPI.get_ts_trace(
+      station_id,
+      "20080130000000",
+      "20220112000000",
+      ["10.00"],
+      "day",
+      "tot",
+      datasource: "CP"
+    )
+    |> DF.new()
+    |> DF.mutate(v: Series.cast(v, :float))
+  end
+
+stream_dfs =
+  for station_id <- stream_station_ids do
+    WaterAPI.get_ts_trace(
+      station_id,
+      "20080130000000",
+      "20220112000000",
+      ["100.00"],
+      "day",
+      "mean",
+      datasource: "CP"
+    )
+    |> DF.new()
+    |> DF.mutate(v: Series.cast(v, :float))
+  end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+[
+  #Explorer.DataFrame<
+    Polars[5097 x 3]
+    q integer [4, 4, 4, 4, 4, ...]
+    t integer [20080130000000, 20080131000000, 20080201000000, 20080202000000, 20080203000000, ...]
+    v float [0.205, 0.266, 0.35, 0.288, 0.25, ...]
+  >,
+  #Explorer.DataFrame<
+    Polars[5097 x 3]
+    q integer [6, 6, 6, 6, 6, ...]
+    t integer [20080130000000, 20080131000000, 20080201000000, 20080202000000, 20080203000000, ...]
+    v float [0.651, 0.742, 0.742, 0.727, 0.735, ...]
+  >
+]
+```
+
+## Deriving 'Water Level Difference'
+
+```elixir
+# making new column which is water level shifted by one day
+water_level_tomorrow =
+  water_level_df["v"]
+  |> Series.shift(-1)
+  |> then(fn s -> DF.new(water_level_tomorrow: s) end)
+
+water_level_df =
+  water_level_df
+  |> DF.concat_columns(water_level_tomorrow)
+  |> DF.mutate(water_level_difference: water_level_tomorrow - v)
+  |> DF.discard("water_level_tomorrow")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Explorer.DataFrame<
+  Polars[5097 x 4]
+  q integer [255, 4, 4, 4, 4, ...]
+  t integer [20080130000000, 20080131000000, 20080201000000, 20080202000000, 20080203000000, ...]
+  v float [-13.594, -13.588, -13.573, -13.564, -13.545, ...]
+  water_level_difference float [0.006000000000000227, 0.014999999999998792, 0.009000000000000341,
+   0.019000000000000128, 0.05400000000000027, ...]
+>
+```
+
+## Cleaning
+
+```elixir
+water_level_df =
+  DF.filter(
+    water_level_df,
+    q != 201 and q != 255
+  )
+
+rainfall_dfs =
+  for df <- rainfall_dfs do
+    df
+    |> DF.mutate(m: Series.cast(q != 201 and q != 255, :integer))
+    |> DF.mutate(v: v * m)
+    |> DF.discard(:m)
+  end
+
+stream_dfs =
+  for df <- stream_dfs do
+    df
+    |> DF.mutate(m: Series.cast(q != 201 and q != 255, :integer))
+    |> DF.mutate(v: v * m)
+    |> DF.discard(:m)
+  end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+[
+  #Explorer.DataFrame<
+    Polars[5097 x 3]
+    q integer [4, 4, 4, 4, 4, ...]
+    t integer [20080130000000, 20080131000000, 20080201000000, 20080202000000, 20080203000000, ...]
+    v float [0.205, 0.266, 0.35, 0.288, 0.25, ...]
+  >,
+  #Explorer.DataFrame<
+    Polars[5097 x 3]
+    q integer [6, 6, 6, 6, 6, ...]
+    t integer [20080130000000, 20080131000000, 20080201000000, 20080202000000, 20080203000000, ...]
+    v float [0.651, 0.742, 0.742, 0.727, 0.735, ...]
+  >
+]
+```
+
+## Renaming Columns
+
+```elixir
+water_level_df = DF.rename(water_level_df, q: "q_212242_130", v: "v_212242_130")
+
+rainfall_df =
+  rainfall_dfs
+  |> Helper.rename_cols_by_id(weather_station_ids, "10")
+  |> Helper.join_dfs()
+
+stream_df =
+  stream_dfs
+  |> Helper.rename_cols_by_id(stream_station_ids, "100")
+  |> Helper.join_dfs()
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Explorer.DataFrame<
+  Polars[5097 x 5]
+  q_212270_100 integer [6, 6, 6, 6, 6, ...]
+  t integer [20080130000000, 20080131000000, 20080201000000, 20080202000000, 20080203000000, ...]
+  v_212270_100 float [0.651, 0.742, 0.742, 0.727, 0.735, ...]
+  q_212250_100 integer [4, 4, 4, 4, 4, ...]
+  v_212250_100 float [0.205, 0.266, 0.35, 0.288, 0.25, ...]
+>
+```
+
+## Joining Data Frames
+
+```elixir
+df =
+  water_level_df
+  |> DF.join(rainfall_df)
+  |> DF.join(stream_df)
+
+DF.names(df)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+["q_212242_130", "t", "v_212242_130", "water_level_difference", "q_568051_10", "v_568051_10",
+ "q_568045_10", "v_568045_10", "q_563079_10", "v_563079_10", "q_563046_10", "v_563046_10",
+ "q_563035_10", "v_563035_10", "q_212270_100", "v_212270_100", "q_212250_100", "v_212250_100"]
+```
+
+## Prepare Data for Neural Net
+
+```elixir
+feature_columns = [
+  "v_568051_10",
+  "v_568045_10",
+  "v_563079_10",
+  "v_563046_10",
+  "v_563035_10",
+  "v_212250_100",
+  "v_212270_100"
+]
+
+label_column = "water_level_difference"
+model_columns = [label_column | feature_columns]
+
+df = DF.select(df, model_columns)
+
+DF.to_csv!(df, "/Users/chris/Code/warragamba-watergate/pres_livebook_data.csv")
+
+kino_table = Kino.DataTable.new(df)
+
+df
+|> Helper.df_to_tensor_batches(1)
+|> Enum.take(3)
+|> IO.inspect()
+
+{train_df, test_df} = Helper.split_data(df, 0.8)
+{train_df, validation_df} = Helper.split_data(train_df, 0.8)
+
+train_features = Helper.df_to_tensor_batches(train_df[feature_columns], 8)
+train_label = Helper.df_to_tensor_batches(train_df[[label_column]], 8)
+
+validation_features = Helper.df_to_tensor_batches(validation_df[feature_columns], 1)
+validation_label = Helper.df_to_tensor_batches(validation_df[[label_column]], 1)
+
+test_features = Helper.df_to_tensor_batches(test_df[feature_columns], 1)
+test_label = Helper.df_to_tensor_batches(test_df[[label_column]], 1)
+
+training_batches =
+  [train_features, train_label]
+  |> Enum.zip()
+
+validation_batches =
+  [validation_features, validation_label]
+  |> Stream.zip()
+
+testing_batches =
+  [test_features, test_label]
+  |> Stream.zip()
+
+kino_table
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+[
+  #Nx.Tensor<
+    f64[1][8]
+    EXLA.Backend<host:0, 0.719542020.2734030864.75838>
+    [
+      [-0.049000000000000044, 0.0, 0.0, 0.0, 0.0, 0.0, 0.377, 0.894]
+    ]
+  >,
+  #Nx.Tensor<
+    f64[1][8]
+    EXLA.Backend<host:0, 0.719542020.2734030864.75839>
+    [
+      [-0.0030000000000001137, 0.0, 0.0, 0.0, 0.0, 0.0, 0.276, 0.619]
+    ]
+  >,
+  #Nx.Tensor<
+    f64[1][8]
+    EXLA.Backend<host:0, 0.719542020.2734030864.75840>
+    [
+      [-0.026000000000000023, 0.0, 0.0, 0.0, 0.0, 0.0, 0.091, 0.322]
+    ]
+  >
+]
+```
+
+```elixir
+row_no = DF.n_rows(df)
+
+graph_data =
+  DF.concat_columns(
+    df[[label_column]],
+    DF.new(%{"count" => Enum.map(1..row_no, & &1)})
+  )
+  |> DF.to_rows()
+
+Vl.new(width: 800, height: 600)
+|> Vl.data_from_values(graph_data |> Enum.take(300))
+|> Vl.encode(:y, field: "water_level_difference", type: :quantitative)
+|> Vl.encode(:x, field: "count", type: :quantitative)
+|> Vl.mark(:line)
+|> Vl.param("grid", select: :interval, bind: :scales)
+```
+
+<!-- livebook:{"output":true} -->
+
+```vega-lite
+{"$schema":"https://vega.github.io/schema/vega-lite/v5.json","data":{"values":[{"count":1,"water_level_difference":0.014999999999998792},{"count":2,"water_level_difference":0.009000000000000341},{"count":3,"water_level_difference":0.019000000000000128},{"count":4,"water_level_difference":0.05400000000000027},{"count":5,"water_level_difference":0.16900000000000048},{"count":6,"water_level_difference":0.10299999999999976},{"count":7,"water_level_difference":0.10199999999999854},{"count":8,"water_level_difference":0.10400000000000098},{"count":9,"water_level_difference":0.15000000000000036},{"count":10,"water_level_difference":0.15799999999999947},{"count":11,"water_level_difference":0.08300000000000018},{"count":12,"water_level_difference":0.05299999999999905},{"count":13,"water_level_difference":0.038000000000000256},{"count":14,"water_level_difference":0.025000000000000355},{"count":15,"water_level_difference":0.019000000000000128},{"count":16,"water_level_difference":0.009999999999999787},{"count":17,"water_level_difference":0.006000000000000227},{"count":18,"water_level_difference":0.012000000000000455},{"count":19,"water_level_difference":0.009000000000000341},{"count":20,"water_level_difference":0.0030000000000001137},{"count":21,"water_level_difference":0.007999999999999119},{"count":22,"water_level_difference":0.006000000000000227},{"count":23,"water_level_difference":-0.0039999999999995595},{"count":24,"water_level_difference":-0.004000000000001336},{"count":25,"water_level_difference":-0.005999999999998451},{"count":26,"water_level_difference":-0.002000000000000668},{"count":27,"water_level_difference":0.03999999999999915},{"count":28,"water_level_difference":0.014000000000001123},{"count":29,"water_level_difference":0.017999999999998906},{"count":30,"water_level_difference":0.0129999999999999},{"count":31,"water_level_difference":0.0070000000000014495},{"count":32,"water_level_difference":0.0030000000000001137},{"count":33,"water_level_difference":0.0039999999999995595},{"count":34,"water_level_difference":-0.0030000000000001137},{"count":35,"water_level_difference":-9.999999999994458e-4},{"count":36,"water_level_difference":-0.002000000000000668},{"count":37,"water_level_difference":0.007999999999999119},{"count":38,"water_level_difference":0.0},{"count":39,"water_level_difference":-0.008999999999998565},{"count":40,"water_level_difference":-0.0070000000000014495},{"count":41,"water_level_difference":-0.005999999999998451},{"count":42,"water_level_difference":-0.004000000000001336},{"count":43,"water_level_difference":-0.0030000000000001137},{"count":44,"water_level_difference":-0.004999999999999005},{"count":45,"water_level_difference":-0.006000000000000227},{"count":46,"water_level_difference":-0.0129999999999999},{"count":47,"water_level_difference":9.999999999994458e-4},{"count":48,"water_level_difference":-0.0039999999999995595},{"count":49,"water_level_difference":-0.0039999999999995595},{"count":50,"water_level_difference":-0.009999999999999787},{"count":51,"water_level_difference":0.005999999999998451},{"count":52,"water_level_difference":-0.0029999999999983373},{"count":53,"water_level_difference":0.0},{"count":54,"water_level_difference":0.017999999999998906},{"count":55,"water_level_difference":0.009999999999999787},{"count":56,"water_level_difference":-9.999999999994458e-4},{"count":57,"water_level_difference":0.002000000000000668},{"count":58,"water_level_difference":0.004999999999999005},{"count":59,"water_level_difference":0.0},{"count":60,"water_level_difference":-0.0039999999999995595},{"count":61,"water_level_difference":0.0},{"count":62,"water_level_difference":-0.0030000000000001137},{"count":63,"water_level_difference":0.005000000000000782},{"count":64,"water_level_difference":-0.009000000000000341},{"count":65,"water_level_difference":-0.006999999999999673},{"count":66,"water_level_difference":-0.0070000000000014495},{"count":67,"water_level_difference":0.0},{"count":68,"water_level_difference":0.0129999999999999},{"count":69,"water_level_difference":0.004000000000001336},{"count":70,"water_level_difference":0.006000000000000227},{"count":71,"water_level_difference":9.999999999994458e-4},{"count":72,"water_level_difference":0.0},{"count":73,"water_level_difference":-0.002000000000000668},{"count":74,"water_level_difference":-0.0019999999999988916},{"count":75,"water_level_difference":-0.002000000000000668},{"count":76,"water_level_difference":-0.006000000000000227},{"count":77,"water_level_difference":0.006999999999999673},{"count":78,"water_level_difference":-9.999999999994458e-4},{"count":79,"water_level_difference":-0.002000000000000668},{"count":80,"water_level_difference":0.004000000000001336},{"count":81,"water_level_difference":0.008999999999998565},{"count":82,"water_level_difference":0.0070000000000014495},{"count":83,"water_level_difference":0.0029999999999983373},{"count":84,"water_level_difference":0.017000000000001236},{"count":85,"water_level_difference":0.017999999999998906},{"count":86,"water_level_difference":0.02000000000000135},{"count":87,"water_level_difference":0.006000000000000227},{"count":88,"water_level_difference":0.004999999999999005},{"count":89,"water_level_difference":-0.0039999999999995595},{"count":90,"water_level_difference":0.010999999999999233},{"count":91,"water_level_difference":-0.0030000000000001137},{"count":92,"water_level_difference":0.009000000000000341},{"count":93,"water_level_difference":-0.0030000000000001137},{"count":94,"water_level_difference":0.002000000000000668},{"count":95,"water_level_difference":-0.0030000000000001137},{"count":96,"water_level_difference":-0.006000000000000227},{"count":97,"water_level_difference":0.008000000000000895},{"count":98,"water_level_difference":-0.002000000000000668},{"count":99,"water_level_difference":-9.999999999994458e-4},{"count":100,"water_level_difference":-0.0010000000000012221},{"count":101,"water_level_difference":-0.0039999999999995595},{"count":102,"water_level_difference":0.0},{"count":103,"water_level_difference":0.0030000000000001137},{"count":104,"water_level_difference":0.002000000000000668},{"count":105,"water_level_difference":0.0030000000000001137},{"count":106,"water_level_difference":-0.0030000000000001137},{"count":107,"water_level_difference":-0.006000000000000227},{"count":108,"water_level_difference":0.006000000000000227},{"count":109,"water_level_difference":-0.006000000000000227},{"count":110,"water_level_difference":9.999999999994458e-4},{"count":111,"water_level_difference":-0.006000000000000227},{"count":112,"water_level_difference":-0.004999999999999005},{"count":113,"water_level_difference":-0.004000000000001336},{"count":114,"water_level_difference":-0.006999999999999673},{"count":115,"water_level_difference":-0.0019999999999988916},{"count":116,"water_level_difference":-0.004000000000001336},{"count":117,"water_level_difference":0.002000000000000668},{"count":118,"water_level_difference":0.002000000000000668},{"count":119,"water_level_difference":-0.0010000000000012221},{"count":120,"water_level_difference":-0.004999999999999005},{"count":121,"water_level_difference":-0.006000000000000227},{"count":122,"water_level_difference":-0.006000000000000227},{"count":123,"water_level_difference":0.007999999999999119},{"count":124,"water_level_difference":0.016000000000000014},{"count":125,"water_level_difference":0.030000000000001137},{"count":126,"water_level_difference":0.04299999999999926},{"count":127,"water_level_difference":0.019999999999999574},{"count":128,"water_level_difference":0.018000000000000682},{"count":129,"water_level_difference":0.009000000000000341},{"count":130,"water_level_difference":0.0129999999999999},{"count":131,"water_level_difference":0.019000000000000128},{"count":132,"water_level_difference":0.01699999999999946},{"count":133,"water_level_difference":0.018000000000000682},{"count":134,"water_level_difference":0.01699999999999946},{"count":135,"water_level_difference":0.0030000000000001137},{"count":136,"water_level_difference":0.002000000000000668},{"count":137,"water_level_difference":0.0039999999999995595},{"count":138,"water_level_difference":0.009000000000000341},{"count":139,"water_level_difference":0.004999999999999005},{"count":140,"water_level_difference":0.009999999999999787},{"count":141,"water_level_difference":0.025000000000000355},{"count":142,"water_level_difference":0.006999999999999673},{"count":143,"water_level_difference":0.0030000000000001137},{"count":144,"water_level_difference":0.009000000000000341},{"count":145,"water_level_difference":0.008000000000000895},{"count":146,"water_level_difference":9.999999999994458e-4},{"count":147,"water_level_difference":0.02099999999999902},{"count":148,"water_level_difference":-0.004999999999999005},{"count":149,"water_level_difference":0.0030000000000001137},{"count":150,"water_level_difference":9.999999999994458e-4},{"count":151,"water_level_difference":0.0},{"count":152,"water_level_difference":0.0030000000000001137},{"count":153,"water_level_difference":-0.010999999999999233},{"count":154,"water_level_difference":0.0030000000000001137},{"count":155,"water_level_difference":0.0030000000000001137},{"count":156,"water_level_difference":-0.002000000000000668},{"count":157,"water_level_difference":-0.002000000000000668},{"count":158,"water_level_difference":0.0010000000000012221},{"count":159,"water_level_difference":0.006999999999999673},{"count":160,"water_level_difference":0.006999999999999673},{"count":161,"water_level_difference":-0.010999999999999233},{"count":162,"water_level_difference":-0.005000000000000782},{"count":163,"water_level_difference":-0.009999999999999787},{"count":164,"water_level_difference":-9.999999999994458e-4},{"count":165,"water_level_difference":0.005999999999998451},{"count":166,"water_level_difference":0.0},{"count":167,"water_level_difference":-0.004999999999999005},{"count":168,"water_level_difference":-0.002000000000000668},{"count":169,"water_level_difference":0.0030000000000001137},{"count":170,"water_level_difference":-0.006999999999999673},{"count":171,"water_level_difference":-0.0030000000000001137},{"count":172,"water_level_difference":0.0},{"count":173,"water_level_difference":0.0},{"count":174,"water_level_difference":-0.0039999999999995595},{"count":175,"water_level_difference":-0.0039999999999995595},{"count":176,"water_level_difference":0.010999999999999233},{"count":177,"water_level_difference":9.999999999994458e-4},{"count":178,"water_level_difference":-9.999999999994458e-4},{"count":179,"water_level_difference":-0.0030000000000001137},{"count":180,"water_level_difference":0.0},{"count":181,"water_level_difference":0.0},{"count":182,"water_level_difference":-0.007999999999999119},{"count":183,"water_level_difference":0.007999999999999119},{"count":184,"water_level_difference":0.006000000000000227},{"count":185,"water_level_difference":-0.005000000000000782},{"count":186,"water_level_difference":-0.0030000000000001137},{"count":187,"water_level_difference":-0.0030000000000001137},{"count":188,"water_level_difference":0.0030000000000001137},{"count":189,"water_level_difference":0.004000000000001336},{"count":190,"water_level_difference":0.010999999999999233},{"count":191,"water_level_difference":-0.015000000000000568},{"count":192,"water_level_difference":0.008000000000000895},{"count":193,"water_level_difference":0.0039999999999995595},{"count":194,"water_level_difference":-0.0039999999999995595},{"count":195,"water_level_difference":-0.002000000000000668},{"count":196,"water_level_difference":0.0010000000000012221},{"count":197,"water_level_difference":-0.009000000000000341},{"count":198,"water_level_difference":-0.008000000000000895},{"count":199,"water_level_difference":-0.010999999999999233},{"count":200,"water_level_difference":9.999999999994458e-4},{"count":201,"water_level_difference":-0.0039999999999995595},{"count":202,"water_level_difference":-0.005000000000000782},{"count":203,"water_level_difference":-0.0019999999999988916},{"count":204,"water_level_difference":0.0039999999999995595},{"count":205,"water_level_difference":-0.005000000000000782},{"count":206,"water_level_difference":-0.0019999999999988916},{"count":207,"water_level_difference":-0.006000000000000227},{"count":208,"water_level_difference":0.0039999999999995595},{"count":209,"water_level_difference":-9.999999999994458e-4},{"count":210,"water_level_difference":-0.002000000000000668},{"count":211,"water_level_difference":0.0},{"count":212,"water_level_difference":-0.006999999999999673},{"count":213,"water_level_difference":0.0030000000000001137},{"count":214,"water_level_difference":-0.002000000000000668},{"count":215,"water_level_difference":0.0},{"count":216,"water_level_difference":-0.0030000000000001137},{"count":217,"water_level_difference":0.0070000000000014495},{"count":218,"water_level_difference":0.006999999999999673},{"count":219,"water_level_difference":0.04800000000000004},{"count":220,"water_level_difference":0.058999999999999275},{"count":221,"water_level_difference":0.062000000000001165},{"count":222,"water_level_difference":0.04499999999999993},{"count":223,"water_level_difference":0.03399999999999892},{"count":224,"water_level_difference":0.022999999999999687},{"count":225,"water_level_difference":0.016000000000000014},{"count":226,"water_level_difference":0.0030000000000001137},{"count":227,"water_level_difference":0.015000000000000568},{"count":228,"water_level_difference":0.010999999999999233},{"count":229,"water_level_difference":0.027000000000001023},{"count":230,"water_level_difference":0.0039999999999995595},{"count":231,"water_level_difference":0.0039999999999995595},{"count":232,"water_level_difference":0.008000000000000895},{"count":233,"water_level_difference":0.0039999999999995595},{"count":234,"water_level_difference":-0.0039999999999995595},{"count":235,"water_level_difference":-0.0030000000000001137},{"count":236,"water_level_difference":0.0},{"count":237,"water_level_difference":-0.006000000000000227},{"count":238,"water_level_difference":-0.0030000000000001137},{"count":239,"water_level_difference":0.0030000000000001137},{"count":240,"water_level_difference":-0.006000000000000227},{"count":241,"water_level_difference":-0.007999999999999119},{"count":242,"water_level_difference":-0.008000000000000895},{"count":243,"water_level_difference":-0.013999999999999346},{"count":244,"water_level_difference":-0.006999999999999673},{"count":245,"water_level_difference":-0.015000000000000568},{"count":246,"water_level_difference":-0.0129999999999999},{"count":247,"water_level_difference":-0.006999999999999673},{"count":248,"water_level_difference":-0.002000000000000668},{"count":249,"water_level_difference":0.0030000000000001137},{"count":250,"water_level_difference":-0.0259999999999998},{"count":251,"water_level_difference":-0.012000000000000455},{"count":252,"water_level_difference":-0.010999999999999233},{"count":253,"water_level_difference":-0.008000000000000895},{"count":254,"water_level_difference":-0.0129999999999999},{"count":255,"water_level_difference":-0.009000000000000341},{"count":256,"water_level_difference":-0.017999999999998906},{"count":257,"water_level_difference":0.006000000000000227},{"count":258,"water_level_difference":-0.002000000000000668},{"count":259,"water_level_difference":0.010999999999999233},{"count":260,"water_level_difference":0.0129999999999999},{"count":261,"water_level_difference":0.002000000000000668},{"count":262,"water_level_difference":0.002000000000000668},{"count":263,"water_level_difference":-0.02200000000000024},{"count":264,"water_level_difference":-0.002000000000000668},{"count":265,"water_level_difference":-0.0039999999999995595},{"count":266,"water_level_difference":-0.008000000000000895},{"count":267,"water_level_difference":-0.004999999999999005},{"count":268,"water_level_difference":-0.0039999999999995595},{"count":269,"water_level_difference":-0.014000000000001123},{"count":270,"water_level_difference":-0.009000000000000341},{"count":271,"water_level_difference":-0.0129999999999999},{"count":272,"water_level_difference":-0.005999999999998451},{"count":273,"water_level_difference":-0.009000000000000341},{"count":274,"water_level_difference":-0.002000000000000668},{"count":275,"water_level_difference":-0.0129999999999999},{"count":276,"water_level_difference":-0.009000000000000341},{"count":277,"water_level_difference":0.002000000000000668},{"count":278,"water_level_difference":-0.015000000000000568},{"count":279,"water_level_difference":-9.999999999994458e-4},{"count":280,"water_level_difference":-0.0039999999999995595},{"count":281,"water_level_difference":-0.012000000000000455},{"count":282,"water_level_difference":0.0030000000000001137},{"count":283,"water_level_difference":-0.022999999999999687},{"count":284,"water_level_difference":-0.0070000000000014495},{"count":285,"water_level_difference":-0.0129999999999999},{"count":286,"water_level_difference":-0.0129999999999999},{"count":287,"water_level_difference":-0.019000000000000128},{"count":288,"water_level_difference":-0.017999999999998906},{"count":289,"water_level_difference":-0.014000000000001123},{"count":290,"water_level_difference":-0.011999999999998678},{"count":291,"water_level_difference":-0.02200000000000024},{"count":292,"water_level_difference":-0.014000000000001123},{"count":293,"water_level_difference":-0.008999999999998565},{"count":294,"water_level_difference":0.008999999999998565},{"count":295,"water_level_difference":-0.013999999999999346},{"count":296,"water_level_difference":0.0030000000000001137},{"count":297,"water_level_difference":-0.03700000000000081},{"count":298,"water_level_difference":-0.0129999999999999},{"count":299,"water_level_difference":-0.017999999999998906},{"count":300,"water_level_difference":-0.005000000000000782}]},"encoding":{"x":{"field":"count","type":"quantitative"},"y":{"field":"water_level_difference","type":"quantitative"}},"height":600,"mark":"line","params":[{"bind":"scales","name":"grid","select":"interval"}],"width":800}
+```
+
+## Building the Model
+
+```elixir
+model =
+  Axon.input("stream_and_rain_model")
+  |> Axon.dropout(rate: 0.5)
+  |> Axon.dense(16)
+  |> Axon.dropout(rate: 0.5)
+  |> Axon.relu()
+  |> Axon.dense(1)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+#Axon<
+  inputs: %{"stream_and_rain_model" => nil}
+  outputs: "dense_1"
+  nodes: 6
+>
+```
+
+## Training the Model
+
+```elixir
+model_params =
+  model
+  |> Axon.Loop.trainer(:mean_absolute_error, Axon.Optimizers.adam(0.001))
+  |> Axon.Loop.validate(model, validation_batches)
+  |> Axon.Loop.metric(:mean_absolute_error, "validation_loss")
+  |> Axon.Loop.run(training_batches, %{}, epochs: 50)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Epoch: 0, Batch: 150, loss: 1.4962101 validation_loss: 1.4930135
+Batch: 741, loss: 0.8017377
+Epoch: 1, Batch: 150, loss: 1.2000639 validation_loss: 0.9452446
+Batch: 741, loss: 0.5630216
+Epoch: 2, Batch: 150, loss: 1.0156400 validation_loss: 0.6723036
+Batch: 741, loss: 0.4410550
+Epoch: 3, Batch: 150, loss: 0.8774340 validation_loss: 0.4862243
+Batch: 741, loss: 0.3482305
+Epoch: 4, Batch: 150, loss: 0.7685397 validation_loss: 0.3508127
+Batch: 741, loss: 0.2679686
+Epoch: 5, Batch: 150, loss: 0.6788951 validation_loss: 0.2473032
+Batch: 741, loss: 0.2392930
+Epoch: 6, Batch: 150, loss: 0.6059773 validation_loss: 0.1854094
+Batch: 741, loss: 0.1986816
+Epoch: 7, Batch: 150, loss: 0.5459177 validation_loss: 0.1386096
+Batch: 741, loss: 0.1656837
+Epoch: 8, Batch: 150, loss: 0.4957983 validation_loss: 0.1067662
+Batch: 741, loss: 0.1407171
+Epoch: 9, Batch: 150, loss: 0.4540751 validation_loss: 0.0879955
+Batch: 741, loss: 0.1152083
+Epoch: 10, Batch: 150, loss: 0.4192426 validation_loss: 0.0788510
+Batch: 741, loss: 0.0997639
+Epoch: 11, Batch: 150, loss: 0.3895547 validation_loss: 0.0705517
+Batch: 741, loss: 0.0879174
+Epoch: 12, Batch: 150, loss: 0.3640069 validation_loss: 0.0626638
+Batch: 741, loss: 0.0769527
+Epoch: 13, Batch: 150, loss: 0.3418503 validation_loss: 0.0592075
+Batch: 741, loss: 0.0787364
+Epoch: 14, Batch: 150, loss: 0.3225883 validation_loss: 0.0572105
+Batch: 741, loss: 0.0725313
+Epoch: 15, Batch: 150, loss: 0.3054443 validation_loss: 0.0529395
+Batch: 741, loss: 0.0738392
+Epoch: 16, Batch: 150, loss: 0.2903801 validation_loss: 0.0537174
+Batch: 741, loss: 0.0665599
+Epoch: 17, Batch: 150, loss: 0.2768108 validation_loss: 0.0492311
+Batch: 741, loss: 0.0658083
+Epoch: 18, Batch: 150, loss: 0.2646566 validation_loss: 0.0491721
+Batch: 741, loss: 0.0640902
+Epoch: 19, Batch: 150, loss: 0.2535632 validation_loss: 0.0459637
+Batch: 741, loss: 0.0600238
+Epoch: 20, Batch: 150, loss: 0.2434500 validation_loss: 0.0437243
+Batch: 741, loss: 0.0607491
+Epoch: 21, Batch: 150, loss: 0.2342242 validation_loss: 0.0434082
+Batch: 741, loss: 0.0582089
+Epoch: 22, Batch: 150, loss: 0.2257447 validation_loss: 0.0410883
+Batch: 741, loss: 0.0592326
+Epoch: 23, Batch: 150, loss: 0.2179541 validation_loss: 0.0411129
+Batch: 741, loss: 0.0565151
+Epoch: 24, Batch: 150, loss: 0.2107907 validation_loss: 0.0414845
+Batch: 741, loss: 0.0559521
+Epoch: 25, Batch: 150, loss: 0.2041612 validation_loss: 0.0402729
+Batch: 741, loss: 0.0541007
+Epoch: 26, Batch: 150, loss: 0.1979824 validation_loss: 0.0394772
+Batch: 741, loss: 0.0574670
+Epoch: 27, Batch: 150, loss: 0.1922543 validation_loss: 0.0391047
+Batch: 741, loss: 0.0525387
+Epoch: 28, Batch: 150, loss: 0.1868704 validation_loss: 0.0380285
+Batch: 741, loss: 0.0536549
+Epoch: 29, Batch: 150, loss: 0.1818567 validation_loss: 0.0380999
+Batch: 741, loss: 0.0540859
+Epoch: 30, Batch: 150, loss: 0.1771363 validation_loss: 0.0369051
+Batch: 741, loss: 0.0523236
+Epoch: 31, Batch: 150, loss: 0.1727095 validation_loss: 0.0371831
+Batch: 741, loss: 0.0497535
+Epoch: 32, Batch: 150, loss: 0.1685059 validation_loss: 0.0355806
+Batch: 741, loss: 0.0509926
+Epoch: 33, Batch: 150, loss: 0.1645539 validation_loss: 0.0356896
+Batch: 741, loss: 0.0486376
+Epoch: 34, Batch: 150, loss: 0.1608002 validation_loss: 0.0347191
+Batch: 741, loss: 0.0497694
+Epoch: 35, Batch: 150, loss: 0.1572593 validation_loss: 0.0348596
+Batch: 741, loss: 0.0478722
+Epoch: 36, Batch: 150, loss: 0.1538792 validation_loss: 0.0336915
+Batch: 741, loss: 0.0490472
+Epoch: 37, Batch: 150, loss: 0.1506947 validation_loss: 0.0343442
+Batch: 741, loss: 0.0470042
+Epoch: 38, Batch: 150, loss: 0.1476491 validation_loss: 0.0333655
+Batch: 741, loss: 0.0477923
+Epoch: 39, Batch: 150, loss: 0.1447523 validation_loss: 0.0332091
+Batch: 741, loss: 0.0460473
+Epoch: 40, Batch: 150, loss: 0.1419840 validation_loss: 0.0325992
+Batch: 741, loss: 0.0463406
+Epoch: 41, Batch: 150, loss: 0.1393471 validation_loss: 0.0327753
+Batch: 741, loss: 0.0452407
+Epoch: 42, Batch: 150, loss: 0.1368226 validation_loss: 0.0322231
+Batch: 741, loss: 0.0453817
+Epoch: 43, Batch: 150, loss: 0.1344070 validation_loss: 0.0318930
+Batch: 741, loss: 0.0440735
+Epoch: 44, Batch: 150, loss: 0.1320950 validation_loss: 0.0319169
+Batch: 741, loss: 0.0444552
+Epoch: 45, Batch: 150, loss: 0.1298807 validation_loss: 0.0316271
+Batch: 741, loss: 0.0434739
+Epoch: 46, Batch: 150, loss: 0.1277563 validation_loss: 0.0313066
+Batch: 741, loss: 0.0437073
+Epoch: 47, Batch: 150, loss: 0.1257223 validation_loss: 0.0314567
+Batch: 741, loss: 0.0426774
+Epoch: 48, Batch: 150, loss: 0.1237613 validation_loss: 0.0308842
+Batch: 741, loss: 0.0431080
+Epoch: 49, Batch: 150, loss: 0.1218837 validation_loss: 0.0311832
+Batch: 741, loss: 0.0419946
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+%{
+  "dense_0" => %{
+    "bias" => #Nx.Tensor<
+      f32[16]
+      EXLA.Backend<host:0, 0.719542020.2734030864.69103>
+      [-0.3284353017807007, -0.3563947379589081, -0.4406614303588867, -0.18989036977291107, -0.7217322587966919, -0.24859140813350677, -0.339288592338562, -0.2360198050737381, -0.26021796464920044, -0.23072706162929535, -0.40605980157852173, -0.4037761688232422, -0.25597652792930603, -0.5712230801582336, -0.4268321990966797, -0.24327537417411804]
+    >,
+    "kernel" => #Nx.Tensor<
+      f32[7][16]
+      EXLA.Backend<host:0, 0.719542020.2734030864.69104>
+      [
+        [-0.03358546644449234, 0.028801754117012024, 0.09362652897834778, 0.12785236537456512, 0.16440947353839874, -0.013776534236967564, 0.056017495691776276, -0.043935731053352356, 0.19044597446918488, -0.03346356749534607, -0.3727398216724396, -0.1179039254784584, -0.3073079288005829, 0.18578122556209564, 0.1760871857404709, -0.09009560197591782],
+        [-0.2139090597629547, -0.009518644772469997, -0.10657729208469391, -0.19316048920154572, -0.020165514200925827, 0.07337448000907898, -0.14930769801139832, -0.16682088375091553, -0.3121021091938019, -0.6384450197219849, -0.0816512331366539, -0.09755107760429382, -0.005272111855447292, -0.18442292511463165, -0.11310344934463501, -0.4681105315685272],
+        [-0.021229222416877747, -0.11571133136749268, 0.35818973183631897, -0.2607422471046448, -0.2655647397041321, -0.35730111598968506, 0.017935482785105705, -0.33286261558532715, -0.19862417876720428, -0.20977653563022614, 3.106965741608292e-4, -0.028816264122724533, -0.04742289334535599, -0.002542909700423479, -0.2300037294626236, ...],
+        ...
+      ]
+    >
+  },
+  "dense_1" => %{
+    "bias" => #Nx.Tensor<
+      f32[1]
+      EXLA.Backend<host:0, 0.719542020.2734030864.69105>
+      [-0.009601432830095291]
+    >,
+    "kernel" => #Nx.Tensor<
+      f32[16][1]
+      EXLA.Backend<host:0, 0.719542020.2734030864.69106>
+      [
+        [-0.0053096069023013115],
+        [7.417321903631091e-4],
+        [-0.12382737547159195],
+        [0.1763000339269638],
+        [-0.014942819252610207],
+        [8.734393049962819e-4],
+        [0.0018085018964484334],
+        [0.0017839950742200017],
+        [-0.13231243193149567],
+        [-0.02322418987751007],
+        [-0.05100463703274727],
+        [0.015240070410072803],
+        [-0.0032366844825446606],
+        [0.05995360016822815],
+        [-0.05423286184668541],
+        [-0.0015131337568163872]
+      ]
+    >
+  }
+}
+```
+
+## Evaluating the Model
+
+```elixir
+model
+|> Axon.Loop.evaluator()
+|> Axon.Loop.metric(:mean_absolute_error)
+|> Axon.Loop.run(testing_batches, model_params, epoch: 1)
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Batch: 927, mean_absolute_error: 0.0296104
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+%{
+  0 => %{
+    "mean_absolute_error" => #Nx.Tensor<
+      f64
+      EXLA.Backend<host:0, 0.719542020.2733506576.75946>
+      0.029610445518231256
+    >
+  }
+}
+```
+
+## Prediction vs Actual Change in Water Level
+
+```elixir
+all_features = Helper.df_to_tensor(df[feature_columns])
+
+all_labels =
+  df[label_column]
+  |> Series.to_tensor()
+  |> Nx.to_flat_list()
+
+{_init_fn, predict_fn} = Axon.build(model, mode: :inference)
+
+predictions =
+  predict_fn.(model_params, all_features)
+  |> Nx.to_flat_list()
+
+row_no = 4640
+
+chart_data =
+  DF.new(
+    prediction: predictions,
+    actual: all_labels,
+    count: Enum.map(1..row_no, & &1)
+  )
+  |> DF.to_rows()
+
+Vl.new(width: 400, height: 400)
+|> Vl.data_from_values(Enum.take(chart_data, 300))
+|> Vl.layers([
+  Vl.new()
+  |> Vl.param("prediction_chart", select: :interval, bind: :scales, encodings: ["x", "y"])
+  |> Vl.encode(:y, field: "prediction", type: :quantitative)
+  |> Vl.encode(:x, field: "count", type: :quantitative)
+  |> Vl.mark(:line, color: "orange"),
+  Vl.new()
+  |> Vl.encode(:x, field: "count", type: :quantitative)
+  |> Vl.encode(:y, field: "actual", type: :quantitative)
+  |> Vl.mark(:line, color: "blue")
+])
+```
+
+<!-- livebook:{"output":true} -->
+
+```vega-lite
+{"$schema":"https://vega.github.io/schema/vega-lite/v5.json","data":{"values":[{"actual":0.014999999999998792,"count":1,"prediction":-0.00783593486994505},{"actual":0.009000000000000341,"count":2,"prediction":-0.00783593486994505},{"actual":0.019000000000000128,"count":3,"prediction":-0.00783593486994505},{"actual":0.05400000000000027,"count":4,"prediction":-0.00783593486994505},{"actual":0.16900000000000048,"count":5,"prediction":-0.00783593486994505},{"actual":0.10299999999999976,"count":6,"prediction":0.004953005351126194},{"actual":0.10199999999999854,"count":7,"prediction":-0.00783593486994505},{"actual":0.10400000000000098,"count":8,"prediction":-0.00783593486994505},{"actual":0.15000000000000036,"count":9,"prediction":-0.00783593486994505},{"actual":0.15799999999999947,"count":10,"prediction":-0.00783593486994505},{"actual":0.08300000000000018,"count":11,"prediction":-0.00783593486994505},{"actual":0.05299999999999905,"count":12,"prediction":-0.00783593486994505},{"actual":0.038000000000000256,"count":13,"prediction":-0.00783593486994505},{"actual":0.025000000000000355,"count":14,"prediction":-0.00783593486994505},{"actual":0.019000000000000128,"count":15,"prediction":-0.00783593486994505},{"actual":0.009999999999999787,"count":16,"prediction":-0.00783593486994505},{"actual":0.006000000000000227,"count":17,"prediction":-0.00783593486994505},{"actual":0.012000000000000455,"count":18,"prediction":-0.00783593486994505},{"actual":0.009000000000000341,"count":19,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":20,"prediction":-0.00783593486994505},{"actual":0.007999999999999119,"count":21,"prediction":-0.00783593486994505},{"actual":0.006000000000000227,"count":22,"prediction":-0.00783593486994505},{"actual":-0.0039999999999995595,"count":23,"prediction":-0.00783593486994505},{"actual":-0.004000000000001336,"count":24,"prediction":-0.00783593486994505},{"actual":-0.005999999999998451,"count":25,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":26,"prediction":-0.00783593486994505},{"actual":0.03999999999999915,"count":27,"prediction":-0.00783593486994505},{"actual":0.014000000000001123,"count":28,"prediction":-0.00783593486994505},{"actual":0.017999999999998906,"count":29,"prediction":-0.00783593486994505},{"actual":0.0129999999999999,"count":30,"prediction":-0.00783593486994505},{"actual":0.0070000000000014495,"count":31,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":32,"prediction":-0.00783593486994505},{"actual":0.0039999999999995595,"count":33,"prediction":-0.00783593486994505},{"actual":-0.0030000000000001137,"count":34,"prediction":-0.00783593486994505},{"actual":-9.999999999994458e-4,"count":35,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":36,"prediction":-0.00783593486994505},{"actual":0.007999999999999119,"count":37,"prediction":-0.00783593486994505},{"actual":0.0,"count":38,"prediction":-0.00783593486994505},{"actual":-0.008999999999998565,"count":39,"prediction":-0.00783593486994505},{"actual":-0.0070000000000014495,"count":40,"prediction":-0.00783593486994505},{"actual":-0.005999999999998451,"count":41,"prediction":-0.00783593486994505},{"actual":-0.004000000000001336,"count":42,"prediction":-0.00783593486994505},{"actual":-0.0030000000000001137,"count":43,"prediction":-0.00783593486994505},{"actual":-0.004999999999999005,"count":44,"prediction":-0.00783593486994505},{"actual":-0.006000000000000227,"count":45,"prediction":-0.00783593486994505},{"actual":-0.0129999999999999,"count":46,"prediction":-0.00783593486994505},{"actual":9.999999999994458e-4,"count":47,"prediction":-0.00783593486994505},{"actual":-0.0039999999999995595,"count":48,"prediction":-0.00783593486994505},{"actual":-0.0039999999999995595,"count":49,"prediction":-0.00783593486994505},{"actual":-0.009999999999999787,"count":50,"prediction":-0.00783593486994505},{"actual":0.005999999999998451,"count":51,"prediction":-0.00783593486994505},{"actual":-0.0029999999999983373,"count":52,"prediction":-0.00783593486994505},{"actual":0.0,"count":53,"prediction":-0.00783593486994505},{"actual":0.017999999999998906,"count":54,"prediction":-0.00783593486994505},{"actual":0.009999999999999787,"count":55,"prediction":-0.00783593486994505},{"actual":-9.999999999994458e-4,"count":56,"prediction":-0.00783593486994505},{"actual":0.002000000000000668,"count":57,"prediction":-0.00783593486994505},{"actual":0.004999999999999005,"count":58,"prediction":-0.00783593486994505},{"actual":0.0,"count":59,"prediction":-0.006018994376063347},{"actual":-0.0039999999999995595,"count":60,"prediction":-0.00783593486994505},{"actual":0.0,"count":61,"prediction":-0.00783593486994505},{"actual":-0.0030000000000001137,"count":62,"prediction":-0.00783593486994505},{"actual":0.005000000000000782,"count":63,"prediction":-0.00783593486994505},{"actual":-0.009000000000000341,"count":64,"prediction":-0.00783593486994505},{"actual":-0.006999999999999673,"count":65,"prediction":-0.00783593486994505},{"actual":-0.0070000000000014495,"count":66,"prediction":-0.00783593486994505},{"actual":0.0,"count":67,"prediction":-0.001979534514248371},{"actual":0.0129999999999999,"count":68,"prediction":-0.00783593486994505},{"actual":0.004000000000001336,"count":69,"prediction":-0.00783593486994505},{"actual":0.006000000000000227,"count":70,"prediction":-0.00783593486994505},{"actual":9.999999999994458e-4,"count":71,"prediction":-0.00783593486994505},{"actual":0.0,"count":72,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":73,"prediction":-0.00783593486994505},{"actual":-0.0019999999999988916,"count":74,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":75,"prediction":-0.00783593486994505},{"actual":-0.006000000000000227,"count":76,"prediction":-0.00783593486994505},{"actual":0.006999999999999673,"count":77,"prediction":-0.00783593486994505},{"actual":-9.999999999994458e-4,"count":78,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":79,"prediction":-0.00783593486994505},{"actual":0.004000000000001336,"count":80,"prediction":-0.00783593486994505},{"actual":0.008999999999998565,"count":81,"prediction":-0.00783593486994505},{"actual":0.0070000000000014495,"count":82,"prediction":-0.00783593486994505},{"actual":0.0029999999999983373,"count":83,"prediction":-0.00783593486994505},{"actual":0.017000000000001236,"count":84,"prediction":-0.00783593486994505},{"actual":0.017999999999998906,"count":85,"prediction":-0.00783593486994505},{"actual":0.02000000000000135,"count":86,"prediction":-0.00783593486994505},{"actual":0.006000000000000227,"count":87,"prediction":-0.00783593486994505},{"actual":0.004999999999999005,"count":88,"prediction":-0.00783593486994505},{"actual":-0.0039999999999995595,"count":89,"prediction":-0.00783593486994505},{"actual":0.010999999999999233,"count":90,"prediction":-0.00783593486994505},{"actual":-0.0030000000000001137,"count":91,"prediction":-0.00783593486994505},{"actual":0.009000000000000341,"count":92,"prediction":-0.00783593486994505},{"actual":-0.0030000000000001137,"count":93,"prediction":-0.00783593486994505},{"actual":0.002000000000000668,"count":94,"prediction":-0.00783593486994505},{"actual":-0.0030000000000001137,"count":95,"prediction":-0.00783593486994505},{"actual":-0.006000000000000227,"count":96,"prediction":-0.00783593486994505},{"actual":0.008000000000000895,"count":97,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":98,"prediction":-0.00783593486994505},{"actual":-9.999999999994458e-4,"count":99,"prediction":-0.00783593486994505},{"actual":-0.0010000000000012221,"count":100,"prediction":-0.00783593486994505},{"actual":-0.0039999999999995595,"count":101,"prediction":-0.00783593486994505},{"actual":0.0,"count":102,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":103,"prediction":-0.00783593486994505},{"actual":0.002000000000000668,"count":104,"prediction":0.5035794377326965},{"actual":0.0030000000000001137,"count":105,"prediction":-0.00783593486994505},{"actual":-0.0030000000000001137,"count":106,"prediction":-0.00783593486994505},{"actual":-0.006000000000000227,"count":107,"prediction":-0.00783593486994505},{"actual":0.006000000000000227,"count":108,"prediction":-0.00783593486994505},{"actual":-0.006000000000000227,"count":109,"prediction":-0.00783593486994505},{"actual":9.999999999994458e-4,"count":110,"prediction":-0.00783593486994505},{"actual":-0.006000000000000227,"count":111,"prediction":-0.00783593486994505},{"actual":-0.004999999999999005,"count":112,"prediction":-0.00783593486994505},{"actual":-0.004000000000001336,"count":113,"prediction":-0.00783593486994505},{"actual":-0.006999999999999673,"count":114,"prediction":-0.00783593486994505},{"actual":-0.0019999999999988916,"count":115,"prediction":-0.00783593486994505},{"actual":-0.004000000000001336,"count":116,"prediction":-0.00783593486994505},{"actual":0.002000000000000668,"count":117,"prediction":-0.00783593486994505},{"actual":0.002000000000000668,"count":118,"prediction":-0.00783593486994505},{"actual":-0.0010000000000012221,"count":119,"prediction":-0.00783593486994505},{"actual":-0.004999999999999005,"count":120,"prediction":-0.00783593486994505},{"actual":-0.006000000000000227,"count":121,"prediction":-0.00783593486994505},{"actual":-0.006000000000000227,"count":122,"prediction":-0.00783593486994505},{"actual":0.007999999999999119,"count":123,"prediction":-0.00783593486994505},{"actual":0.016000000000000014,"count":124,"prediction":-0.00783593486994505},{"actual":0.030000000000001137,"count":125,"prediction":-0.00783593486994505},{"actual":0.04299999999999926,"count":126,"prediction":-0.00783593486994505},{"actual":0.019999999999999574,"count":127,"prediction":-0.00783593486994505},{"actual":0.018000000000000682,"count":128,"prediction":-0.00783593486994505},{"actual":0.009000000000000341,"count":129,"prediction":-0.00783593486994505},{"actual":0.0129999999999999,"count":130,"prediction":-0.00783593486994505},{"actual":0.019000000000000128,"count":131,"prediction":-0.00783593486994505},{"actual":0.01699999999999946,"count":132,"prediction":-0.00783593486994505},{"actual":0.018000000000000682,"count":133,"prediction":-0.00783593486994505},{"actual":0.01699999999999946,"count":134,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":135,"prediction":-0.00783593486994505},{"actual":0.002000000000000668,"count":136,"prediction":-0.00783593486994505},{"actual":0.0039999999999995595,"count":137,"prediction":-0.00783593486994505},{"actual":0.009000000000000341,"count":138,"prediction":-0.00783593486994505},{"actual":0.004999999999999005,"count":139,"prediction":-0.00783593486994505},{"actual":0.009999999999999787,"count":140,"prediction":-0.00783593486994505},{"actual":0.025000000000000355,"count":141,"prediction":-0.00783593486994505},{"actual":0.006999999999999673,"count":142,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":143,"prediction":-0.00783593486994505},{"actual":0.009000000000000341,"count":144,"prediction":-0.00783593486994505},{"actual":0.008000000000000895,"count":145,"prediction":-0.00783593486994505},{"actual":9.999999999994458e-4,"count":146,"prediction":-0.00783593486994505},{"actual":0.02099999999999902,"count":147,"prediction":-0.00783593486994505},{"actual":-0.004999999999999005,"count":148,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":149,"prediction":-0.00783593486994505},{"actual":9.999999999994458e-4,"count":150,"prediction":-0.00783593486994505},{"actual":0.0,"count":151,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":152,"prediction":-0.00783593486994505},{"actual":-0.010999999999999233,"count":153,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":154,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":155,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":156,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":157,"prediction":-0.00783593486994505},{"actual":0.0010000000000012221,"count":158,"prediction":-0.00783593486994505},{"actual":0.006999999999999673,"count":159,"prediction":-0.00783593486994505},{"actual":0.006999999999999673,"count":160,"prediction":-0.00783593486994505},{"actual":-0.010999999999999233,"count":161,"prediction":-0.00783593486994505},{"actual":-0.005000000000000782,"count":162,"prediction":-0.00783593486994505},{"actual":-0.009999999999999787,"count":163,"prediction":-0.00783593486994505},{"actual":-9.999999999994458e-4,"count":164,"prediction":-0.00783593486994505},{"actual":0.005999999999998451,"count":165,"prediction":-0.00783593486994505},{"actual":0.0,"count":166,"prediction":-0.00783593486994505},{"actual":-0.004999999999999005,"count":167,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":168,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":169,"prediction":-0.00783593486994505},{"actual":-0.006999999999999673,"count":170,"prediction":-0.00783593486994505},{"actual":-0.0030000000000001137,"count":171,"prediction":-0.00783593486994505},{"actual":0.0,"count":172,"prediction":-0.00783593486994505},{"actual":0.0,"count":173,"prediction":-0.00783593486994505},{"actual":-0.0039999999999995595,"count":174,"prediction":-0.00783593486994505},{"actual":-0.0039999999999995595,"count":175,"prediction":-0.00783593486994505},{"actual":0.010999999999999233,"count":176,"prediction":-0.00783593486994505},{"actual":9.999999999994458e-4,"count":177,"prediction":-0.00783593486994505},{"actual":-9.999999999994458e-4,"count":178,"prediction":-0.00783593486994505},{"actual":-0.0030000000000001137,"count":179,"prediction":-0.00783593486994505},{"actual":0.0,"count":180,"prediction":-0.00783593486994505},{"actual":0.0,"count":181,"prediction":-0.00783593486994505},{"actual":-0.007999999999999119,"count":182,"prediction":-0.00783593486994505},{"actual":0.007999999999999119,"count":183,"prediction":-0.00783593486994505},{"actual":0.006000000000000227,"count":184,"prediction":-0.00783593486994505},{"actual":-0.005000000000000782,"count":185,"prediction":-0.00783593486994505},{"actual":-0.0030000000000001137,"count":186,"prediction":-0.00783593486994505},{"actual":-0.0030000000000001137,"count":187,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":188,"prediction":-0.00783593486994505},{"actual":0.004000000000001336,"count":189,"prediction":-0.00783593486994505},{"actual":0.010999999999999233,"count":190,"prediction":-0.00783593486994505},{"actual":-0.015000000000000568,"count":191,"prediction":-0.00783593486994505},{"actual":0.008000000000000895,"count":192,"prediction":-0.00783593486994505},{"actual":0.0039999999999995595,"count":193,"prediction":-0.00783593486994505},{"actual":-0.0039999999999995595,"count":194,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":195,"prediction":-0.00783593486994505},{"actual":0.0010000000000012221,"count":196,"prediction":-0.00783593486994505},{"actual":-0.009000000000000341,"count":197,"prediction":-0.00783593486994505},{"actual":-0.008000000000000895,"count":198,"prediction":-0.00783593486994505},{"actual":-0.010999999999999233,"count":199,"prediction":-0.00783593486994505},{"actual":9.999999999994458e-4,"count":200,"prediction":-0.00783593486994505},{"actual":-0.0039999999999995595,"count":201,"prediction":-0.00783593486994505},{"actual":-0.005000000000000782,"count":202,"prediction":-0.00783593486994505},{"actual":-0.0019999999999988916,"count":203,"prediction":-0.00783593486994505},{"actual":0.0039999999999995595,"count":204,"prediction":-0.00783593486994505},{"actual":-0.005000000000000782,"count":205,"prediction":-0.00783593486994505},{"actual":-0.0019999999999988916,"count":206,"prediction":-0.00783593486994505},{"actual":-0.006000000000000227,"count":207,"prediction":-0.00783593486994505},{"actual":0.0039999999999995595,"count":208,"prediction":-0.00783593486994505},{"actual":-9.999999999994458e-4,"count":209,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":210,"prediction":-0.00783593486994505},{"actual":0.0,"count":211,"prediction":-0.00783593486994505},{"actual":-0.006999999999999673,"count":212,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":213,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":214,"prediction":-0.00783593486994505},{"actual":0.0,"count":215,"prediction":-0.00783593486994505},{"actual":-0.0030000000000001137,"count":216,"prediction":-0.00783593486994505},{"actual":0.0070000000000014495,"count":217,"prediction":-0.00783593486994505},{"actual":0.006999999999999673,"count":218,"prediction":-0.00783593486994505},{"actual":0.04800000000000004,"count":219,"prediction":-0.00783593486994505},{"actual":0.058999999999999275,"count":220,"prediction":-0.00783593486994505},{"actual":0.062000000000001165,"count":221,"prediction":-0.00783593486994505},{"actual":0.04499999999999993,"count":222,"prediction":-0.00783593486994505},{"actual":0.03399999999999892,"count":223,"prediction":-0.00783593486994505},{"actual":0.022999999999999687,"count":224,"prediction":-0.00783593486994505},{"actual":0.016000000000000014,"count":225,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":226,"prediction":-0.00783593486994505},{"actual":0.015000000000000568,"count":227,"prediction":-0.00783593486994505},{"actual":0.010999999999999233,"count":228,"prediction":-0.00783593486994505},{"actual":0.027000000000001023,"count":229,"prediction":-0.00783593486994505},{"actual":0.0039999999999995595,"count":230,"prediction":-0.00783593486994505},{"actual":0.0039999999999995595,"count":231,"prediction":-0.00783593486994505},{"actual":0.008000000000000895,"count":232,"prediction":-0.00783593486994505},{"actual":0.0039999999999995595,"count":233,"prediction":-0.00783593486994505},{"actual":-0.0039999999999995595,"count":234,"prediction":-0.00783593486994505},{"actual":-0.0030000000000001137,"count":235,"prediction":-0.00783593486994505},{"actual":0.0,"count":236,"prediction":-0.00783593486994505},{"actual":-0.006000000000000227,"count":237,"prediction":-0.00783593486994505},{"actual":-0.0030000000000001137,"count":238,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":239,"prediction":-0.00783593486994505},{"actual":-0.006000000000000227,"count":240,"prediction":-0.00783593486994505},{"actual":-0.007999999999999119,"count":241,"prediction":-0.00783593486994505},{"actual":-0.008000000000000895,"count":242,"prediction":-0.00783593486994505},{"actual":-0.013999999999999346,"count":243,"prediction":-0.00783593486994505},{"actual":-0.006999999999999673,"count":244,"prediction":-0.00783593486994505},{"actual":-0.015000000000000568,"count":245,"prediction":-0.00783593486994505},{"actual":-0.0129999999999999,"count":246,"prediction":0.01821073144674301},{"actual":-0.006999999999999673,"count":247,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":248,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":249,"prediction":-0.00783593486994505},{"actual":-0.0259999999999998,"count":250,"prediction":-0.00783593486994505},{"actual":-0.012000000000000455,"count":251,"prediction":-0.00783593486994505},{"actual":-0.010999999999999233,"count":252,"prediction":-0.00783593486994505},{"actual":-0.008000000000000895,"count":253,"prediction":-0.00783593486994505},{"actual":-0.0129999999999999,"count":254,"prediction":-0.00783593486994505},{"actual":-0.009000000000000341,"count":255,"prediction":-0.00783593486994505},{"actual":-0.017999999999998906,"count":256,"prediction":-0.00783593486994505},{"actual":0.006000000000000227,"count":257,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":258,"prediction":-0.00783593486994505},{"actual":0.010999999999999233,"count":259,"prediction":-0.00783593486994505},{"actual":0.0129999999999999,"count":260,"prediction":-0.00783593486994505},{"actual":0.002000000000000668,"count":261,"prediction":-0.00783593486994505},{"actual":0.002000000000000668,"count":262,"prediction":-0.00783593486994505},{"actual":-0.02200000000000024,"count":263,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":264,"prediction":-0.00783593486994505},{"actual":-0.0039999999999995595,"count":265,"prediction":-0.00783593486994505},{"actual":-0.008000000000000895,"count":266,"prediction":-0.00783593486994505},{"actual":-0.004999999999999005,"count":267,"prediction":-0.00783593486994505},{"actual":-0.0039999999999995595,"count":268,"prediction":-0.00783593486994505},{"actual":-0.014000000000001123,"count":269,"prediction":-0.00783593486994505},{"actual":-0.009000000000000341,"count":270,"prediction":-0.00783593486994505},{"actual":-0.0129999999999999,"count":271,"prediction":-0.00783593486994505},{"actual":-0.005999999999998451,"count":272,"prediction":-0.00783593486994505},{"actual":-0.009000000000000341,"count":273,"prediction":-0.00783593486994505},{"actual":-0.002000000000000668,"count":274,"prediction":-0.00783593486994505},{"actual":-0.0129999999999999,"count":275,"prediction":-0.00783593486994505},{"actual":-0.009000000000000341,"count":276,"prediction":-0.00783593486994505},{"actual":0.002000000000000668,"count":277,"prediction":-0.00783593486994505},{"actual":-0.015000000000000568,"count":278,"prediction":-0.00783593486994505},{"actual":-9.999999999994458e-4,"count":279,"prediction":-0.00783593486994505},{"actual":-0.0039999999999995595,"count":280,"prediction":-0.00783593486994505},{"actual":-0.012000000000000455,"count":281,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":282,"prediction":-0.00783593486994505},{"actual":-0.022999999999999687,"count":283,"prediction":-0.00783593486994505},{"actual":-0.0070000000000014495,"count":284,"prediction":-0.00783593486994505},{"actual":-0.0129999999999999,"count":285,"prediction":-0.00783593486994505},{"actual":-0.0129999999999999,"count":286,"prediction":-0.00783593486994505},{"actual":-0.019000000000000128,"count":287,"prediction":-0.00783593486994505},{"actual":-0.017999999999998906,"count":288,"prediction":-0.00783593486994505},{"actual":-0.014000000000001123,"count":289,"prediction":0.009092998690903187},{"actual":-0.011999999999998678,"count":290,"prediction":-0.00783593486994505},{"actual":-0.02200000000000024,"count":291,"prediction":-0.00783593486994505},{"actual":-0.014000000000001123,"count":292,"prediction":-0.00783593486994505},{"actual":-0.008999999999998565,"count":293,"prediction":-0.00783593486994505},{"actual":0.008999999999998565,"count":294,"prediction":-0.00783593486994505},{"actual":-0.013999999999999346,"count":295,"prediction":-0.00783593486994505},{"actual":0.0030000000000001137,"count":296,"prediction":-0.00783593486994505},{"actual":-0.03700000000000081,"count":297,"prediction":-0.00783593486994505},{"actual":-0.0129999999999999,"count":298,"prediction":-0.00783593486994505},{"actual":-0.017999999999998906,"count":299,"prediction":-0.00783593486994505},{"actual":-0.005000000000000782,"count":300,"prediction":-0.00783593486994505}]},"height":400,"layer":[{"encoding":{"x":{"field":"count","type":"quantitative"},"y":{"field":"prediction","type":"quantitative"}},"mark":{"color":"orange","type":"line"},"params":[{"bind":"scales","encodings":["x","y"],"name":"prediction_chart","select":"interval"}]},{"encoding":{"x":{"field":"count","type":"quantitative"},"y":{"field":"actual","type":"quantitative"}},"mark":{"color":"blue","type":"line"}}],"width":400}
+```
