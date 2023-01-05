@@ -12,9 +12,12 @@ poetry install
 
 # starts the shell
 poetry shell
+
+# start notebook with
+jupyter notebook
 ```
 
-If using VSCode use the Python env denoted as 'Poetry env'
+If using VSCode don't run the last command, use the Jupyter notebooks extension and use the Python env denoted as 'Poetry env'
 
 ---
 
