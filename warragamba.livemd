@@ -137,34 +137,29 @@ defmodule Helper do
     end
   end
 
-  def join_dfs(dfs, opts \\ []) when is_list(dfs) do
-    how = Keyword.get(opts, :how, :inner)
-    on = Keyword.get(opts, :on, nil)
-
+  def join_dfs(dfs) when is_list(dfs) do
     Enum.reduce(dfs, fn df, acc ->
-      if on do
-        DF.join(df, acc, how: how, on: on)
-      else
-        DF.join(df, acc, how: how)
-      end
+      DF.join(df, acc, how: :inner)
     end)
   end
 
   def split_data(df, decimal) do
+    row_no = DF.n_rows(df)
+
     {first, second} =
       df
       |> DF.to_rows()
       |> Enum.shuffle()
-      |> split_by_decimal(decimal)
+      |> Enum.split(round(decimal * row_no))
 
     {DF.new(first), DF.new(second)}
   end
 
-  def df_to_tensor(df) do
-    df
-    |> DF.names()
-    |> Enum.map(&Explorer.Series.to_tensor(df[&1]))
-    |> Nx.stack(axis: 1)
+  def df_to_batches(df, feature_cols, label_col, batch_size \\ 1) do
+    Stream.zip(
+      df_to_tensor_batches(df[feature_cols], batch_size),
+      df_to_tensor_batches(df[[label_col]], batch_size)
+    )
   end
 
   def df_to_tensor_batches(df, batch_size) do
@@ -174,14 +169,13 @@ defmodule Helper do
     |> Nx.to_batched(batch_size, leftover: :discard)
   end
 
-  defp split_by_decimal(enum, decimal) do
-    row_no = Enum.count(enum)
-    Enum.split(enum, round(decimal * row_no))
+  def df_to_tensor(df) do
+    df
+    |> DF.names()
+    |> Enum.map(&Explorer.Series.to_tensor(df[&1]))
+    |> Nx.stack(axis: 1)
   end
 end
-
-# testing df_to_tensor
-Helper.df_to_tensor(DF.new(a: [1, 2, 3], b: [9, 7, 6]))
 ```
 
 ```elixir
@@ -263,7 +257,7 @@ water_level_df =
 rainfall_dfs =
   for df <- rainfall_dfs do
     df
-    |> DF.mutate(m: Series.cast(q != 201 and q != 255, :integer))
+    |> DF.mutate(m: cast(q != 201 and q != 255, :integer))
     |> DF.mutate(v: v * m)
     |> DF.discard(:m)
   end
@@ -271,7 +265,7 @@ rainfall_dfs =
 stream_dfs =
   for df <- stream_dfs do
     df
-    |> DF.mutate(m: Series.cast(q != 201 and q != 255, :integer))
+    |> DF.mutate(m: cast(q != 201 and q != 255, :integer))
     |> DF.mutate(v: v * m)
     |> DF.discard(:m)
   end
@@ -322,40 +316,12 @@ model_columns = [label_column | feature_columns]
 
 df = DF.select(df, model_columns)
 
-DF.to_csv!(df, "/Users/chris/Code/warragamba-watergate/pres_livebook_data.csv")
-
-kino_table = Kino.DataTable.new(df)
-
-df
-|> Helper.df_to_tensor_batches(1)
-|> Enum.take(3)
-|> IO.inspect()
-
 {train_df, test_df} = Helper.split_data(df, 0.8)
 {train_df, validation_df} = Helper.split_data(train_df, 0.8)
 
-train_features = Helper.df_to_tensor_batches(train_df[feature_columns], 8)
-train_label = Helper.df_to_tensor_batches(train_df[[label_column]], 8)
-
-validation_features = Helper.df_to_tensor_batches(validation_df[feature_columns], 1)
-validation_label = Helper.df_to_tensor_batches(validation_df[[label_column]], 1)
-
-test_features = Helper.df_to_tensor_batches(test_df[feature_columns], 1)
-test_label = Helper.df_to_tensor_batches(test_df[[label_column]], 1)
-
-training_batches =
-  [train_features, train_label]
-  |> Enum.zip()
-
-validation_batches =
-  [validation_features, validation_label]
-  |> Stream.zip()
-
-testing_batches =
-  [test_features, test_label]
-  |> Stream.zip()
-
-kino_table
+training_batches = Helper.df_to_batches(train_df, feature_columns, label_column, 8)
+validation_batches = Helper.df_to_batches(validation_df, feature_columns, label_column, 1)
+testing_batches = Helper.df_to_batches(test_df, feature_columns, label_column, 1)
 ```
 
 ```elixir
